@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<!--
+  Fitts' Law Data Collection App
+  --------------------------------
+  A single-file, dependency-free HTML/JS app used to collect the dataset for
+  Problem 1. Runs in any modern browser on any device (laptop trackpad/mouse,
+  desktop, tablet with stylus, etc.) -- no installation needed, which is why
+  it was the chosen platform for distributing to batchmates (see the
+  brainstorming/justification section in the notebook).
+
+  Flow:
+   1. Landing screen: participant types their name and (optionally) changes
+      the trial count (defaults to 100). Clicking "Begin" locks in the name
+      and switches to the task screen.
+   2. Task screen: classic 1-D Fitts' reciprocal-tapping task (see protocol
+      below). "Download CSV" is only enabled once the block is finished.
+
+  Protocol implemented:
+   - A "Start" circle is shown; the participant clicks it to begin a trial.
+   - A square target of size W then appears at distance D from the start
+     point, either to the LEFT (Direction = -1) or RIGHT (Direction = +1)
+     of the start point, on a horizontal line at the vertical center of the
+     canvas (a classic 1-D Fitts' reciprocal tapping layout).
+   - Distance (D) and Size (W) are each sampled uniformly at random, every
+     trial, from 4 experimenter-defined values (>= 4 variations each, as
+     required). Direction is sampled uniformly from {-1, +1}.
+   - Time = milliseconds from target-appearance to the FIRST click that
+     lands inside the target.
+   - Errors = number of clicks that land OUTSIDE the target before the
+     first click that lands inside it.
+   - Distance Traveled = total path length (px) of mouse-pointer movement
+     between target-appearance and the successful click (sum of segment
+     lengths between consecutive `mousemove` samples), which will exceed
+     the straight-line Distance whenever the cursor overshoots/corrects.
+   - Every trial's row is appended to an in-memory table and rendered live;
+     "Download CSV" exports it in exactly the schema required.
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Fitts' Law Task</title>
+<style>
+  body { font-family: system-ui, sans-serif; text-align: center; background:#fafafa; margin:0; padding:20px;}
+  .screen { display:none; }
+  .screen.active { display:block; }
+
+  /* --- landing screen --- */
+  #welcome-card {
+    max-width: 420px; margin: 60px auto; background:#fff; border:2px solid #333;
+    border-radius:12px; padding:32px 28px; text-align:left;
+  }
+  #welcome-card h2 { text-align:center; margin-top:0; }
+  #welcome-card label { display:block; font-size:14px; font-weight:600; margin:16px 0 6px; }
+  #welcome-card input { width:100%; box-sizing:border-box; padding:8px 10px; font-size:15px; border:1px solid #bbb; border-radius:6px; }
+  #welcome-card .hint { font-size:12px; color:#777; margin-top:4px; }
+  #welcome-card button { width:100%; margin-top:24px; padding:12px; font-size:16px; background:#2b7de9; color:#fff; border:none; border-radius:6px; cursor:pointer; }
+  #welcome-card button:disabled { background:#aac4ea; cursor:not-allowed; }
+  #welcome-error { color:#c0392b; font-size:13px; margin-top:8px; min-height:16px; }
+
+  /* --- task screen --- */
+  #meta { margin-bottom: 10px; font-size:15px; }
+  #meta b { color:#2b7de9; }
+  canvas { background:#fff; border:2px solid #333; border-radius:8px; touch-action:none; cursor:crosshair; }
+  #status { margin-top:10px; font-size:18px; }
+  button.small { padding:8px 16px; margin:6px; font-size:15px; cursor:pointer; }
+  button.small:disabled { opacity:0.5; cursor:not-allowed; }
+  table { margin: 20px auto; border-collapse: collapse; font-size:12px; max-height:250px; overflow-y:auto; display:block;}
+  th, td { border:1px solid #ccc; padding:3px 8px; }
+  th { background:#eee; position:sticky; top:0; }
+</style>
+</head>
+<body>
+
+<!-- ============================ LANDING SCREEN ============================ -->
+<div id="screen-welcome" class="screen active">
+  <div id="welcome-card">
+    <h2>Fitts' Law Task</h2>
+    <p style="font-size:14px; color:#555;">
+      You'll click a blue start circle, then click an orange target square as
+      quickly and accurately as you can, over and over. Please enter your
+      name below to begin.
+    </p>
+    <label for="pname">Your name</label>
+    <input id="pname" type="text" placeholder="e.g. Priya Sharma" autofocus>
+
+    <div class="hint" style="margin-top:16px;">You will complete <b>100 trials</b>.</div>
+
+    <button id="begin-btn" onclick="beginFromWelcome()">Begin</button>
+    <div id="welcome-error"></div>
+  </div>
+</div>
+
+<!-- ============================= TASK SCREEN =============================== -->
+<div id="screen-task" class="screen">
+  <h2>Fitts' Law Data Collection</h2>
+  <div id="meta">
+    Participant: <b id="pname-display"></b> &nbsp;|&nbsp; Trials: <b>100</b>
+    <br>
+    <button class="small" onclick="startExperiment()">(Re)Start Experiment</button>
+    <button class="small" id="download-btn" onclick="downloadCSV()" disabled>Download CSV</button>
+  </div>
+  <div id="status">Click "(Re)Start Experiment" to begin.</div>
+  <canvas id="canvas" width="900" height="300"></canvas>
+
+  <table id="datatable">
+   <thead><tr><th>#</th><th>Distance</th><th>Size</th><th>Direction</th>
+   <th>Time (ms)</th><th>Distance Traveled</th><th>Errors</th></tr></thead>
+   <tbody></tbody>
+  </table>
+</div>
+
+<script>
+// ---- Configurable independent variables (>=4 levels each) ----------------
+// Values are chosen so that, together with the canvas width (900px) and a
+// margin, every Distance/Size combination fits on screen for every
+// Direction. Feel free to scale these relative to YOUR screen resolution
+// before sending the link to participants (see notebook discussion).
+const DISTANCES = [150, 250, 350, 450];   // px, center-to-center
+const SIZES     = [40, 64, 96, 128];      // px, square side length
+
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const cy = canvas.height/2;
+const startX = canvas.width/2;
+
+let participantName = '';
+const TRIALS_PLANNED = 100;   // fixed, not editable by the participant
+let trialsPlanned = TRIALS_PLANNED, trialIdx = 0, results = [];
+let currentTarget = null, trialStartTime = null, errorCount = 0;
+let path = [], lastPos = null, pathLength = 0;
+let awaitingStartClick = true;
+
+// ---------------------------- landing screen -------------------------------
+function beginFromWelcome(){
+  const nameInput = document.getElementById('pname');
+  const name = nameInput.value.trim();
+  const errEl = document.getElementById('welcome-error');
+  if (!name){
+    errEl.innerText = 'Please enter your name to continue.';
+    nameInput.focus();
+    return;
+  }
+  errEl.innerText = '';
+  participantName = name;
+  trialsPlanned = TRIALS_PLANNED;
+
+  document.getElementById('pname-display').innerText = participantName;
+
+  document.getElementById('screen-welcome').classList.remove('active');
+  document.getElementById('screen-task').classList.add('active');
+
+  startExperiment();
+}
+
+// ------------------------------ task screen ---------------------------------
+function drawStart(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.beginPath();
+  ctx.arc(startX, cy, 12, 0, 2*Math.PI);
+  ctx.fillStyle = '#2b7de9';
+  ctx.fill();
+}
+
+function pickDirectionSafe(){
+  // ensure target + margin stays on canvas regardless of distance chosen
+  return Math.random() < 0.5 ? -1 : 1;
+}
+
+function newTrial(){
+  if (trialIdx >= trialsPlanned){
+    document.getElementById('status').innerText =
+      `Done! Collected ${results.length} trials. Click "Download CSV".`;
+    document.getElementById('download-btn').disabled = (results.length === 0);
+    drawStart();
+    return;
+  }
+  const D = DISTANCES[Math.floor(Math.random()*DISTANCES.length)];
+  const W = SIZES[Math.floor(Math.random()*SIZES.length)];
+  const dir = pickDirectionSafe();
+  currentTarget = {D, W, dir, x: startX + dir*D, y: cy};
+  errorCount = 0; path = []; lastPos = null; pathLength = 0;
+  awaitingStartClick = false;
+  trialStartTime = performance.now();
+
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.fillStyle = '#e0762b';
+  ctx.fillRect(currentTarget.x - W/2, currentTarget.y - W/2, W, W);
+  document.getElementById('status').innerText =
+    `Trial ${trialIdx+1}/${trialsPlanned} — click the orange square`;
+}
+
+function startExperiment(){
+  // trial count can still be adjusted on the task screen via a restart if needed
+  trialIdx = 0; results = [];
+  document.querySelector('#datatable tbody').innerHTML = '';
+  document.getElementById('download-btn').disabled = true;
+  awaitingStartClick = true;
+  drawStart();
+  document.getElementById('status').innerText = 'Click the blue circle to begin.';
+}
+
+canvas.addEventListener('mousemove', (e)=>{
+  const rect = canvas.getBoundingClientRect();
+  const pos = {x:e.clientX-rect.left, y:e.clientY-rect.top};
+  if (!awaitingStartClick && currentTarget){
+    if (lastPos){
+      pathLength += Math.hypot(pos.x-lastPos.x, pos.y-lastPos.y);
+    }
+    lastPos = pos;
+  }
+});
+
+canvas.addEventListener('click', (e)=>{
+  const rect = canvas.getBoundingClientRect();
+  const x = e.clientX-rect.left, y = e.clientY-rect.top;
+
+  if (awaitingStartClick){
+    if (Math.hypot(x-startX,y-cy) <= 12){
+      awaitingStartClick = false;
+      newTrial();
+    }
+    return;
+  }
+  if (!currentTarget) return;
+  const t = currentTarget;
+  const inside = Math.abs(x-t.x) <= t.W/2 && Math.abs(y-t.y) <= t.W/2;
+  if (inside){
+    const timeMs = performance.now() - trialStartTime;
+    const row = {
+      Distance: t.D, Size: t.W, Direction: t.dir,
+      Time: Math.round(timeMs*100)/100,
+      Distance_Traveled: Math.round(pathLength*100)/100,
+      Errors: errorCount
+    };
+    results.push(row);
+    appendRow(results.length, row);
+    trialIdx++;
+    currentTarget = null;
+    setTimeout(()=>{ awaitingStartClick=true; drawStart();
+      document.getElementById('status').innerText='Click the blue circle for next trial.'; }, 150);
+  } else {
+    errorCount++;
+  }
+});
+
+function appendRow(n,row){
+  const tbody = document.querySelector('#datatable tbody');
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td>${n}</td><td>${row.Distance}</td><td>${row.Size}</td>
+    <td>${row.Direction}</td><td>${row.Time}</td><td>${row.Distance_Traveled}</td><td>${row.Errors}</td>`;
+  tbody.appendChild(tr);
+}
+
+function downloadCSV(){
+  const safeName = (participantName || 'participant').replace(/[^a-z0-9]+/gi, '_');
+  let csv = 'User,Trial,Distance,Size,Direction,Time,Distance_Traveled,Errors\n';
+  results.forEach((r,i)=>{
+    csv += `${participantName},${i+1},${r.Distance},${r.Size},${r.Direction},${r.Time},${r.Distance_Traveled},${r.Errors}\n`;
+  });
+  const blob = new Blob([csv], {type:'text/csv'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `fitts_${safeName}.csv`;
+  a.click();
+}
+
+// allow pressing Enter in the name field to begin
+document.getElementById('pname').addEventListener('keydown', (e)=>{
+  if (e.key === 'Enter') beginFromWelcome();
+});
+
+drawStart();
+</script>
+</body>
+</html>
